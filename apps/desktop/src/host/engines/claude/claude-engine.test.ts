@@ -4591,6 +4591,49 @@ describe("ClaudeEngine — report turns after nested agents (CLI 2.1.330 capture
     } finally { await engine.dispose("session-close"); }
   });
 
+  it("w0-21: foreground children started while idle stay detached when their later frames arrive inside an owner turn", async () => {
+    const { transport, engine, native, rest } = await drive("w0-21-nested-foreground-agents.jsonl");
+    try {
+      const detached: AgentEvent[] = [];
+      engine.onDetachedEvent = (event) => detached.push(event);
+      type TaskFrame = Frame & { parent_task_id?: string; task_type?: string; tool_use_id?: string };
+      const idle = rest[0]! as TaskFrame[];
+      const started = idle.filter((frame) => frame.subtype === "task_started" && frame.parent_task_id !== undefined && frame.task_type === "local_agent");
+      const children = started.map((frame) => frame.tool_use_id!);
+      expect(children).toHaveLength(2);
+      const lastStart = idle.indexOf(started[1]!);
+      const endOf = (child: string): number => idle.findIndex((frame) => frame.subtype === "task_notification" && frame.tool_use_id === child);
+      const firstEnd = endOf(children[0]!);
+      expect(lastStart).toBeLessThan(firstEnd);
+      expect(firstEnd).toBeLessThan(endOf(children[1]!));
+      // Up to both children's first task_progress: they are running, the engine idle.
+      const whileIdle = idle.slice(0, lastStart + 3);
+      expect(whileIdle.filter((frame) => frame.subtype === "task_progress").map((frame) => frame.tool_use_id)).toEqual(expect.arrayContaining(children));
+      const cards = (): AgentEvent[] => detached.filter((event) => event.type.startsWith("subagent_") && children.includes((event as { toolCallId: string }).toolCallId));
+      for (const frame of whileIdle) transport.push(frame);
+      await vi.waitFor(() => expect(cards().filter((event) => event.type === "subagent_progress")).toHaveLength(2));
+
+      // The owner turn's stream carries the first child's end; the second is still running when the turn ends.
+      for (const frame of [...idle.slice(lastStart + 3, firstEnd + 1), ...ownerFrames("two")]) transport.enqueue(frame);
+      const owner = await collect(engine.runTurn("second", { signal: new AbortController().signal }));
+      expect(JSON.stringify(owner)).toContain("OWNER OUTPUT two");
+      expect(owner.filter((event) => event.type.startsWith("subagent_"))).toEqual([]);
+      expect(cards().filter((event) => event.type === "subagent_end")).toEqual([
+        expect.objectContaining({ toolCallId: children[0], status: "completed" }),
+      ]);
+
+      for (const frame of idle.slice(firstEnd + 1)) transport.push(frame);
+      await vi.waitFor(() => expect(native).toHaveLength(1));
+      expect(cards().filter((event) => event.type === "subagent_end")).toEqual([
+        expect.objectContaining({ toolCallId: children[0], status: "completed" }),
+        expect.objectContaining({ toolCallId: children[1], status: "completed" }),
+      ]);
+      expect(types(cards())).toEqual([
+        "subagent_start", "subagent_start", "subagent_progress", "subagent_progress", "subagent_end", "subagent_end",
+      ]);
+    } finally { await engine.dispose("session-close"); }
+  });
+
   it("w0-26: the nested agent's report turn has no assistant frame and adopts nothing, but settles its entry; the parent's report turn is adopted", async () => {
     const { transport, engine, native, rest } = await drive("w0-26-nested-agent-finishes-before-parent.jsonl");
     try {

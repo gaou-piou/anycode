@@ -211,7 +211,7 @@ export function reduceAgentCensus(census: AgentCensus, frame: ClaudeStreamMessag
  * True when the agent is backgrounded, or its running ancestor chain is: a
  * settled parent (a waiting one included) no longer carries its children.
  */
-function lineageBackgrounded(census: AgentCensus, entry: AgentCensusAgent): boolean {
+export function lineageBackgrounded(census: AgentCensus, entry: AgentCensusAgent): boolean {
   let current: AgentCensusAgent = entry;
   for (let depth = 0; depth < MAX_DEPTH; depth += 1) {
     if (current.backgrounded) return true;

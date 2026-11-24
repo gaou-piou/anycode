@@ -2601,8 +2601,9 @@ export class ClaudeEngine implements SessionEngine {
         const frame = raced.value.value;
         if (isClaudeSubagentFrame(frame)) {
           // An agent the CLI keeps running (run_in_background) reports during
-          // the summarization turn too; no turn carries its card here.
-          for (const event of this.subagentTasks.onFrame(frame)) this.emitDetached(event);
+          // the summarization turn too; no turn carries its card here, so an
+          // agent it starts is born detached.
+          for (const event of this.subagentTasks.onFrame(frame, { detached: true })) this.emitDetached(event);
           const task = this.nativeBackgroundTasks.onFrame(frame);
           if (task) this.emitDetached(task);
           continue;
@@ -3213,9 +3214,12 @@ export class ClaudeEngine implements SessionEngine {
         // agent the CLI is still running, not to a turn: a `run_in_background`
         // agent keeps working after its parent turn's result. They must never
         // open a foreign turn — the next owner send would then wait for a
-        // result the agent never produces.
+        // result the agent never produces. An agent first seen here is born
+        // detached: a later owner turn whose stream carries its frames must
+        // not adopt its card. The tracker sends a detached task's events to
+        // the sink itself; only an attached task's come back.
         const knownSubagent = this.subagentTasks.knowsNotification(frame);
-        for (const event of this.subagentTasks.onFrame(frame)) this.emitDetached(event);
+        for (const event of this.subagentTasks.onFrame(frame, { detached: true })) this.emitDetached(event);
         const task = this.nativeBackgroundTasks.onFrame(frame);
         if (task) this.emitDetached(task);
         this.trackNotification(frame, knownSubagent || (task !== undefined && task.status !== "running"));

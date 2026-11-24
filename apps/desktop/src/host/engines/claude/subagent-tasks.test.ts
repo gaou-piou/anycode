@@ -259,6 +259,93 @@ describe("ClaudeSubagentTasks — edge cases", () => {
   });
 });
 
+/**
+ * A task the tracker first sees outside an owner turn has no card in any turn:
+ * its frames may later arrive inside an unrelated owner turn's stream, which
+ * must not adopt them (w0-21: a background parent's foreground children start
+ * while idle; w0-23: a nested agent restarts under a parent that already settled).
+ */
+describe("ClaudeSubagentTasks — tasks born detached", () => {
+  it("a task started outside an owner turn is born detached", () => {
+    const detached: AgentEvent[] = [];
+    const tasks = new ClaudeSubagentTasks((event) => detached.push(event));
+    expect(tasks.onFrame(system("task_started", { task_id: "a1", tool_use_id: "toolu_a", is_backgrounded: false }), { detached: true })).toEqual([]);
+    // Its later frames, inside an owner turn (default options), still go to the sink.
+    expect(tasks.onFrame(system("task_progress", { task_id: "a1", usage: { tool_uses: 1 } }))).toEqual([]);
+    expect(tasks.onFrame(system("task_notification", { task_id: "a1", status: "completed" }))).toEqual([]);
+    expect(detached).toEqual([
+      { type: "subagent_start", toolCallId: "toolu_a", agentType: "agent", description: "" },
+      { type: "subagent_progress", toolCallId: "toolu_a", turns: 1, toolCalls: 1 },
+      { type: "subagent_end", toolCallId: "toolu_a", status: "completed", turns: 1, toolCalls: 1, durationMs: -1 },
+    ]);
+  });
+
+  it("a task whose parent is detached is born detached", () => {
+    const detached: AgentEvent[] = [];
+    const tasks = new ClaudeSubagentTasks((event) => detached.push(event));
+    tasks.onFrame(system("task_started", { task_id: "p", run_id: "rp", tool_use_id: "toolu_p", task_type: "local_agent", is_backgrounded: true }));
+    tasks.detachLive();
+    expect(tasks.onFrame(system("task_started", { task_id: "c", run_id: "rc", tool_use_id: "toolu_c", parent_task_id: "p", task_type: "local_agent", is_backgrounded: false }))).toEqual([]);
+    expect(detached).toEqual([{ type: "subagent_start", toolCallId: "toolu_c", agentType: "agent", description: "" }]);
+  });
+
+  it("a task whose parent is live and attached stays with the owner turn", () => {
+    const tasks = new ClaudeSubagentTasks();
+    tasks.onFrame(system("task_started", { task_id: "p", run_id: "rp", tool_use_id: "toolu_p", task_type: "local_agent", is_backgrounded: true }));
+    expect(tasks.onFrame(system("task_started", { task_id: "c", run_id: "rc", tool_use_id: "toolu_c", parent_task_id: "p", task_type: "local_agent", is_backgrounded: false }))).toHaveLength(1);
+  });
+
+  it("a restart whose parent already settled is born detached", () => {
+    const detached: AgentEvent[] = [];
+    const tasks = new ClaudeSubagentTasks((event) => detached.push(event));
+    // w0-23's shape: the nested agent ends its run to wait on its own command;
+    // its parent settles meanwhile; the CLI restarts it under the same task_id.
+    tasks.onFrame(system("task_started", { task_id: "p", run_id: "rp", tool_use_id: "toolu_p", task_type: "local_agent", is_backgrounded: true }));
+    tasks.onFrame(system("task_started", { task_id: "c", run_id: "rc1", tool_use_id: "toolu_c", parent_task_id: "p", task_type: "local_agent", is_backgrounded: true }));
+    tasks.onFrame(system("task_updated", { task_id: "p", run_id: "rp", patch: { status: "completed" } }));
+    tasks.onFrame(system("task_notification", { task_id: "p", run_id: "rp", tool_use_id: "toolu_p", status: "completed" }));
+    tasks.onFrame(system("task_updated", { task_id: "c", run_id: "rc1", patch: { status: "completed" } }));
+    tasks.onFrame(system("task_notification", { task_id: "c", run_id: "rc1", tool_use_id: "toolu_c", status: "completed" }));
+    expect(detached).toEqual([]);
+    expect(tasks.onFrame(system("task_started", { task_id: "c", run_id: "rc2", tool_use_id: "toolu_c", parent_task_id: "p", task_type: "local_agent", is_backgrounded: true }))).toEqual([]);
+    expect(detached).toEqual([{ type: "subagent_start", toolCallId: "toolu_c", agentType: "agent", description: "" }]);
+  });
+
+  it("detachLive leaves detached tasks alone", () => {
+    const detached: AgentEvent[] = [];
+    const tasks = new ClaudeSubagentTasks((event) => detached.push(event));
+    tasks.onFrame(system("task_started", { task_id: "fg", tool_use_id: "toolu_fg", is_backgrounded: false }), { detached: true });
+    detached.length = 0;
+    tasks.detachLive();
+    expect(detached).toEqual([]);
+    tasks.onFrame(system("task_notification", { task_id: "fg", status: "completed" }));
+    expect(detached).toMatchObject([{ type: "subagent_end", toolCallId: "toolu_fg", status: "completed" }]);
+  });
+
+  it("detachLive does not cancel a foreground child of a live background agent", () => {
+    const detached: AgentEvent[] = [];
+    const tasks = new ClaudeSubagentTasks((event) => detached.push(event));
+    tasks.onFrame(system("task_started", { task_id: "p", run_id: "rp", tool_use_id: "toolu_p", task_type: "local_agent", is_backgrounded: true }));
+    tasks.onFrame(system("task_started", { task_id: "c", run_id: "rc", tool_use_id: "toolu_c", parent_task_id: "p", task_type: "local_agent", is_backgrounded: false }));
+    tasks.detachLive();
+    expect(detached).toEqual([]);
+    expect(tasks.onFrame(system("task_notification", { task_id: "c", run_id: "rc", tool_use_id: "toolu_c", status: "completed" }))).toEqual([]);
+    expect(detached).toMatchObject([{ type: "subagent_end", toolCallId: "toolu_c", status: "completed" }]);
+  });
+
+  it("detachLive still cancels a foreground child whose parent is foreground too", () => {
+    const detached: AgentEvent[] = [];
+    const tasks = new ClaudeSubagentTasks((event) => detached.push(event));
+    tasks.onFrame(system("task_started", { task_id: "p", run_id: "rp", tool_use_id: "toolu_p", task_type: "local_agent", is_backgrounded: false }));
+    tasks.onFrame(system("task_started", { task_id: "c", run_id: "rc", tool_use_id: "toolu_c", parent_task_id: "p", task_type: "local_agent", is_backgrounded: false }));
+    tasks.detachLive();
+    expect(detached).toMatchObject([
+      { type: "subagent_end", toolCallId: "toolu_p", status: "cancelled" },
+      { type: "subagent_end", toolCallId: "toolu_c", status: "cancelled" },
+    ]);
+  });
+});
+
 describe("ClaudeSubagentTasks — an agent resumed by SendMessage", () => {
   // Wire shape captured from claude 2.1.325: the resumed run reuses the task_id,
   // its task_* frames carry the SendMessage call's tool_use_id, and the child's

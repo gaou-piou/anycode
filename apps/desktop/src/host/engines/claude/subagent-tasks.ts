@@ -26,7 +26,7 @@
  */
 
 import { summarizeChildToolCall, type AgentEvent } from "@anycode/core";
-import { countWorkingBackgroundAgents, EMPTY_AGENT_CENSUS, reduceAgentCensus, type AgentCensus } from "./agent-census.js";
+import { countWorkingBackgroundAgents, EMPTY_AGENT_CENSUS, lineageBackgrounded, reduceAgentCensus, type AgentCensus } from "./agent-census.js";
 import type { ClaudeStreamMessage } from "./protocol.js";
 
 /** How long a drop of the background agent count to 0 waits before it is reported; a rise meanwhile cancels it. */
@@ -68,7 +68,11 @@ interface TrackedTask {
    * A later `task_updated` patch can move a foreground agent to the background.
    */
   backgrounded: boolean;
-  /** The task outlived the owner turn that started it: its events go to the detached sink from then on. */
+  /**
+   * No owner turn carries this task's card: it outlived the turn that started
+   * it, or it started outside one (between turns, or under a parent no turn
+   * carries). Its events go to the detached sink, wherever its frames arrive.
+   */
   detached: boolean;
   /** Distinct child `message.id`s seen: one per model response, however many frames it spans. */
   responses: Set<string>;
@@ -115,9 +119,10 @@ export class ClaudeSubagentTasks {
   private disposed = false;
 
   /**
-   * @param detach receives the events of a task that outlived its owner turn
-   * (`detachLive`), wherever its frames arrive — between turns or inside a
-   * later owner turn, which must not adopt another turn's card.
+   * @param detach receives the events of a task no owner turn carries — one
+   * that outlived its turn (`detachLive`) or was born detached — wherever its
+   * frames arrive: between turns or inside a later owner turn, which must not
+   * adopt a card that is not its own.
    */
   constructor(
     private readonly detach: (event: AgentEvent) => void = () => {},
@@ -134,14 +139,17 @@ export class ClaudeSubagentTasks {
    * Feeds one frame; returns the subagent_* events it implies for the current
    * owner turn (usually none). Events of a detached task go to the detach sink
    * instead. Never throws on an unexpected shape.
+   *
+   * `detached`: the frame arrived outside an owner turn, so a task it starts
+   * is born detached. The owner turn's translator leaves it unset.
    */
-  onFrame(frame: ClaudeStreamMessage): AgentEvent[] {
+  onFrame(frame: ClaudeStreamMessage, options: { detached?: boolean } = {}): AgentEvent[] {
     const next = reduceAgentCensus(this.census, frame);
     if (next !== this.census) {
       this.census = next;
       this.countChanged(countWorkingBackgroundAgents(next));
     }
-    const { task, events } = this.translate(frame);
+    const { task, events } = this.translate(frame, options.detached === true);
     if (task?.detached !== true) return events;
     for (const event of events) this.detach(event);
     return [];
@@ -188,15 +196,40 @@ export class ClaudeSubagentTasks {
    * The owner turn ended. A background task still running reports through
    * the detach sink from now on. A foreground task still running was cut off
    * with its turn (a Stop): it settles as cancelled here, since its card
-   * would otherwise read as dispatched to the background.
+   * would otherwise read as dispatched to the background. A detached task
+   * belongs to no turn and is left alone. A foreground task working for a
+   * live background agent was not cut off either: the CLI keeps its parent,
+   * and so the task, running past the turn.
    */
   detachLive(): void {
     for (const [taskId, task] of this.tasks) {
+      if (task.detached) continue;
       task.detached = true;
-      if (task.backgrounded) continue;
+      if (task.backgrounded || this.carriedByBackground(taskId)) continue;
       this.settle(taskId, task);
       this.detach(this.endEvent(task, "cancelled", -1));
     }
+  }
+
+  /** The census reads the task's running ancestors as backgrounded. */
+  private carriedByBackground(taskId: string): boolean {
+    const entry = this.census.get(taskId);
+    return entry?.kind === "agent" && lineageBackgrounded(this.census, entry);
+  }
+
+  /**
+   * A task starts with the owner turn only when the frame arrived inside one
+   * and its parent, if it names one, is a running agent that turn still
+   * carries. Otherwise no turn shows its card, and a later owner turn must
+   * not adopt its frames: it is born detached.
+   */
+  private bornDetached(fields: Record<string, unknown>, outsideTurn: boolean): boolean {
+    if (outsideTurn) return true;
+    const parentTaskId = text(fields.parent_task_id);
+    if (parentTaskId === undefined) return false;
+    const parent = this.census.get(parentTaskId);
+    if (parent?.kind !== "agent" || !parent.running) return true;
+    return this.tasks.get(parentTaskId)?.detached !== false;
   }
 
   /** Forgets a live task, keeping what a SendMessage resume of it needs. */
@@ -205,13 +238,13 @@ export class ClaudeSubagentTasks {
     this.history.set(taskId, { agentCall: task.agentCall, toolUses: task.baseToolUses + task.toolCalls });
   }
 
-  private translate(frame: ClaudeStreamMessage): { task?: TrackedTask; events: AgentEvent[] } {
+  private translate(frame: ClaudeStreamMessage, outsideTurn: boolean): { task?: TrackedTask; events: AgentEvent[] } {
     if (typeof frame.parent_tool_use_id === "string") return this.onChildFrame(frame.parent_tool_use_id, frame);
     if (frame.type !== "system") return { events: [] };
     const fields = frame as Record<string, unknown>;
     switch (fields.subtype) {
       case "task_started":
-        return this.onStarted(fields);
+        return this.onStarted(fields, outsideTurn);
       case "task_progress":
         return this.onProgress(fields);
       case "task_notification":
@@ -255,7 +288,7 @@ export class ClaudeSubagentTasks {
     return { task, events };
   }
 
-  private onStarted(fields: Record<string, unknown>): { task?: TrackedTask; events: AgentEvent[] } {
+  private onStarted(fields: Record<string, unknown>, outsideTurn: boolean): { task?: TrackedTask; events: AgentEvent[] } {
     const taskId = text(fields.task_id);
     const toolCallId = text(fields.tool_use_id);
     const taskType = text(fields.task_type);
@@ -284,7 +317,7 @@ export class ClaudeSubagentTasks {
       baseToolUses,
       ...(seen === undefined ? {} : { resumedAt: Date.now() }),
       backgrounded: fields.is_backgrounded !== false,
-      detached: false,
+      detached: this.bornDetached(fields, outsideTurn),
       responses: new Set(),
       toolUses: new Set(),
       toolCalls: 0,
