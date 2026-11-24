@@ -3905,6 +3905,53 @@ describe("ClaudeEngine — the CLI's own background agents", () => {
     await engine.dispose("session-close");
   });
 
+  it("an agent notification during /compact arms the report turn after it", async () => {
+    const transport = new FakeTransport({ frames: parentTurn, contextUsage: { totalTokens: 1, maxTokens: 2 } });
+    const engine = engineWith(transport);
+    const native: Promise<AgentEvent[]>[] = [];
+    engine.onNativeTurn = (turn) => native.push(collect(turn));
+    engine.onDetachedEvent = () => {};
+    await collect(engine.runTurn("launch it", { signal: new AbortController().signal }));
+
+    for (const frame of [...idleAgentFrames, resultFrame157("completed")]) transport.enqueue(frame);
+    const events = await collect(engine.compactNow({ signal: new AbortController().signal }));
+    expect(events.find((event) => event.type === "compaction_end")).toMatchObject({ ok: true });
+    expect(pendingNotifications(engine)).toEqual([expect.objectContaining({ runId: "0mwkq1xid-ee3842c6" })]);
+
+    for (const frame of remapSession(reportTurn)) transport.push(frame);
+    await vi.waitFor(() => expect(native).toHaveLength(1));
+    expect(await native[0]!).toContainEqual(expect.objectContaining({ type: "loop_end", reason: "completed" }));
+    expect(pendingNotifications(engine)).toEqual([]);
+    await engine.dispose("session-close");
+  });
+
+  it("a notification replayed during /compact is consumed", async () => {
+    // Defensive, synthetic: no capture shows the CLI replaying a notification
+    // inside a compaction. Were it to, that turn has consumed the run.
+    const transport = new FakeTransport({ frames: parentTurn, contextUsage: { totalTokens: 1, maxTokens: 2 } });
+    const engine = engineWith(transport);
+    const native: Promise<AgentEvent[]>[] = [];
+    engine.onNativeTurn = (turn) => native.push(collect(turn));
+    engine.onDetachedEvent = () => {};
+    await collect(engine.runTurn("launch it", { signal: new AbortController().signal }));
+    for (const frame of idleAgentFrames) transport.push(frame);
+    await vi.waitFor(() => expect(pendingNotifications(engine)).toHaveLength(1));
+
+    const replay = { type: "user", isReplay: true, message: { role: "user", content: "<task-notification>done</task-notification>" }, origin: { kind: "task-notification", producer: "session-task", runId: "0mwkq1xid-ee3842c6" } } as unknown as ClaudeStreamMessage;
+    for (const frame of [replay, resultFrame157("completed")]) transport.enqueue(frame);
+    await collect(engine.compactNow({ signal: new AbortController().signal }));
+    expect(pendingNotifications(engine)).toEqual([]);
+
+    // A later turn the engine did not ask for is foreign, not adopted.
+    const init = reportTurn.find((frame) => frame.type === "system" && (frame as { subtype?: string }).subtype === "init")!;
+    for (const frame of [init, foreignAssistantFrame("later", "LATER"), foreignResultFrame("later")]) transport.push(frame);
+    for (const frame of ownerFrames("two")) transport.enqueue(frame);
+    const events = await collect(engine.runTurn("second", { signal: new AbortController().signal }));
+    expect(native).toHaveLength(0);
+    expect(events.filter(isForeignNotice)).toHaveLength(1);
+    await engine.dispose("session-close");
+  });
+
   describe("a running agent's card settles as cancelled when the CLI that ran it is gone", () => {
     const cancelled = { type: "subagent_end", toolCallId: "toolu_01AJKBpVVvTVqpg8nKBashrq", status: "cancelled" };
 
