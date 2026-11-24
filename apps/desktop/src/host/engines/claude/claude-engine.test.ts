@@ -4648,4 +4648,36 @@ describe("ClaudeEngine — report turns after nested agents (CLI 2.1.330 capture
       expect(pendingNotifications(engine)).toEqual([]);
     } finally { await engine.dispose("session-close"); }
   });
+
+  /** Feeds a capture whole, then an unrelated untagged turn; the foreign notice only surfaces on the next owner turn's drain. */
+  async function expectNothingWaitedFor(file: string, adopted: number): Promise<void> {
+    const { transport, engine, native, rest } = await drive(file);
+    try {
+      for (const frame of rest.flat()) transport.push(frame);
+      await vi.waitFor(() => expect(native).toHaveLength(adopted));
+      expect(pendingNotifications(engine)).toEqual([]);
+      transport.push({ type: "system", subtype: "init", model: "default", permissionMode: "default", cwd: "/work", tools: [], mcp_servers: [], slash_commands: [], skills: [], capabilities: [] } as unknown as ClaudeStreamMessage);
+      transport.push(foreignAssistantFrame("stray", "STRAY"));
+      transport.push(foreignResultFrame("stray"));
+      for (const frame of ownerFrames("after")) transport.enqueue(frame);
+      const owner = await collect(engine.runTurn("after", { signal: new AbortController().signal }));
+      expect(JSON.stringify(owner)).toContain("OWNER OUTPUT after");
+      expect(owner.some((event) => event.type === "error")).toBe(false);
+      expect(owner).toContainEqual(expect.objectContaining({ type: "engine_notice" }));
+      expect(JSON.stringify(owner)).not.toContain("STRAY");
+      expect(native).toHaveLength(adopted);
+    } finally { await engine.dispose("session-close"); }
+  }
+
+  it("w0-23: after a subagent-owned command's notification, nothing is left pending and a later foreign turn is not adopted", async () => {
+    await expectNothingWaitedFor("w0-23-agent-restarted-by-own-task.jsonl", 3);
+  });
+
+  it("w0-24: after an interrupt stops the agent's command, nothing is left pending and a later foreign turn is not adopted", async () => {
+    await expectNothingWaitedFor("w0-24-interrupt-stops-agent-command.jsonl", 1);
+  });
+
+  it("w0-25: the agent's own stopped notification after an interrupt leaves nothing pending", async () => {
+    await expectNothingWaitedFor("w0-25-interrupt-kills-running-agent.jsonl", 0);
+  });
 });

@@ -17,6 +17,17 @@ export class ClaudeNativeBackgroundTasks {
    * position relative to the notification is not part of the contract.
    */
   private readonly foreground = new Map<string, string | undefined>();
+  /**
+   * Tasks a SUBAGENT started (`owned_by_subagent:true` on `task_started`), of
+   * any task type, keyed by id and run. Kept apart from `foreground`: a
+   * backgrounding patch deletes a foreground entry, but the task stays the
+   * subagent's, whose own report covers it.
+   */
+  private readonly subagentOwned = new Set<string>();
+
+  private static ownedKey(id: string, run: unknown): string {
+    return `${id}\0${typeof run === "string" ? run : ""}`;
+  }
 
   /** A frame naming another run of a reused task id must not touch this run's state. */
   private foregroundRunMatches(id: string, f: Record<string, unknown>): boolean {
@@ -26,20 +37,31 @@ export class ClaudeNativeBackgroundTasks {
   }
 
   /**
-   * True for the terminal notification of a foreground task: it settles the
-   * running tool call itself and no autonomous turn follows it. Consumes the
-   * id, so each notification is classified once.
+   * True for a terminal notification after which the CLI starts NO turn of its
+   * own, so nothing may wait for one. Consumes the id, so each notification is
+   * classified once. Three kinds (CLI 2.1.330 captures):
+   * - a foreground task: it settles the running tool call itself (w0-20, w0-21);
+   * - a task a subagent owns: the subagent's own report covers it, the main
+   *   session gets no turn (w0-23 `bdcsig06x`, w0-24 `baqf2b3lc`);
+   * - work that was stopped or killed, whether a command after an interrupt
+   *   (w0-24) or the agent itself (w0-25, `task_updated killed` then
+   *   `task_notification stopped`).
    */
-  takeForegroundCompletion(frame: ClaudeStreamMessage): boolean {
+  takeTurnlessCompletion(frame: ClaudeStreamMessage): boolean {
     if (frame.type !== "system" || frame.subtype !== "task_notification") return false;
     const f = frame as Record<string, unknown>;
     const id = f.task_id;
-    return typeof id === "string" && this.foregroundRunMatches(id, f) && this.foreground.delete(id);
+    if (typeof id !== "string") return false;
+    const foreground = this.foregroundRunMatches(id, f) && this.foreground.delete(id);
+    const ownedKey = [ClaudeNativeBackgroundTasks.ownedKey(id, f.run_id), ClaudeNativeBackgroundTasks.ownedKey(id, undefined)].find(key => this.subagentOwned.has(key));
+    if (ownedKey) this.subagentOwned.delete(ownedKey);
+    return foreground || ownedKey !== undefined || f.status === "stopped" || f.status === "killed";
   }
 
   /** Transport loss does not establish whether the native command stopped. */
   abandonAll(): Task[] {
     this.foreground.clear();
+    this.subagentOwned.clear();
     const changed: Task[] = [];
     for (const [id, task] of this.tasks) {
       if (task.status !== "running") continue;
@@ -68,6 +90,9 @@ export class ClaudeNativeBackgroundTasks {
     if (f.subtype === "task_started") {
       if (f.is_backgrounded === false) this.foreground.set(id, typeof f.run_id === "string" && f.run_id ? f.run_id : undefined);
       else this.foreground.delete(id);
+      const owned = ClaudeNativeBackgroundTasks.ownedKey(id, f.run_id);
+      if (f.owned_by_subagent === true) this.subagentOwned.add(owned);
+      else this.subagentOwned.delete(owned);
       const kind = f.task_type === "local_bash" ? "bash" : f.task_type === "monitor" || f.task_type === "local_monitor" ? "monitor" : undefined;
       if (!kind || typeof f.tool_use_id !== "string" || !f.tool_use_id) return undefined;
       const task: Task = { type: "claude_background_task", taskId: id, toolCallId: f.tool_use_id, kind,

@@ -1168,9 +1168,11 @@ export class ClaudeEngine implements SessionEngine {
   /** Records a task notification seen by the engine. */
   private trackNotification(frame: ClaudeStreamMessage, settledKnownTask: boolean): void {
     if (frame.type !== "system" || frame.subtype !== "task_notification") return;
-    // A foreground task (a long Bash command, a foreground Agent) completes
-    // inside the owner's own tool call: no autonomous turn follows it.
-    if (this.nativeBackgroundTasks.takeForegroundCompletion(frame)) return;
+    // No autonomous turn follows a foreground task (a long Bash command, a
+    // foreground Agent: it completes inside the owner's own tool call), a task
+    // a subagent owns, or work that was stopped or killed (w0-23, w0-24,
+    // w0-25). Asked first: a stopped agent is a known task too.
+    if (this.nativeBackgroundTasks.takeTurnlessCompletion(frame)) return;
     if (settledKnownTask || this.nativeBackgroundTasks.knowsNotification(frame)) this.noteNotification(frame);
     else {
       this.unmatchedNotification = true;

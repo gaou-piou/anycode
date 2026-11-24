@@ -71,26 +71,61 @@ describe("native background task correlation", () => {
     tasks.onFrame(frame("task_started", { task_id: "fg", tool_use_id: "tfg", task_type: "local_bash", is_backgrounded: false }));
     const fgDone = frame("task_notification", { task_id: "fg", tool_use_id: "tfg", status: "completed" });
     tasks.onFrame(fgDone);
-    expect(tasks.takeForegroundCompletion(fgDone)).toBe(true);
+    expect(tasks.takeTurnlessCompletion(fgDone)).toBe(true);
     // Consumed: the same id is never classified twice, so the set cannot leak.
-    expect(tasks.takeForegroundCompletion(fgDone)).toBe(false);
+    expect(tasks.takeTurnlessCompletion(fgDone)).toBe(false);
     // Background Bash.
     tasks.onFrame(frame("task_started", { task_id: "bg", tool_use_id: "tbg", task_type: "local_bash", is_backgrounded: true }));
     const bgDone = frame("task_notification", { task_id: "bg", tool_use_id: "tbg", status: "completed" });
     tasks.onFrame(bgDone);
-    expect(tasks.takeForegroundCompletion(bgDone)).toBe(false);
+    expect(tasks.takeTurnlessCompletion(bgDone)).toBe(false);
     // Foreground Agent (w0-20): not a tracked task kind, still foreground.
     expect(tasks.onFrame(frame("task_started", { task_id: "agent", tool_use_id: "tagent", task_type: "local_agent", is_backgrounded: false }))).toBeUndefined();
     tasks.onFrame(frame("task_updated", { task_id: "agent", patch: { status: "completed" } }));
-    expect(tasks.takeForegroundCompletion(frame("task_notification", { task_id: "agent", tool_use_id: "tagent", status: "completed" }))).toBe(true);
+    expect(tasks.takeTurnlessCompletion(frame("task_notification", { task_id: "agent", tool_use_id: "tagent", status: "completed" }))).toBe(true);
     // Moved to the background by a task_updated patch: its completion starts a turn.
     tasks.onFrame(frame("task_started", { task_id: "moved", tool_use_id: "tmoved", task_type: "local_bash", is_backgrounded: false }));
     tasks.onFrame(frame("task_updated", { task_id: "moved", patch: { is_backgrounded: true } }));
-    expect(tasks.takeForegroundCompletion(frame("task_notification", { task_id: "moved", tool_use_id: "tmoved", status: "completed" }))).toBe(false);
+    expect(tasks.takeTurnlessCompletion(frame("task_notification", { task_id: "moved", tool_use_id: "tmoved", status: "completed" }))).toBe(false);
     // Observation ending forgets every foreground id.
     tasks.onFrame(frame("task_started", { task_id: "lost", tool_use_id: "tlost", task_type: "local_bash", is_backgrounded: false }));
     tasks.abandonAll();
-    expect(tasks.takeForegroundCompletion(frame("task_notification", { task_id: "lost", tool_use_id: "tlost", status: "completed" }))).toBe(false);
+    expect(tasks.takeTurnlessCompletion(frame("task_notification", { task_id: "lost", tool_use_id: "tlost", status: "completed" }))).toBe(false);
+  });
+  it("a task owned by a subagent completes without a turn", () => {
+    const tasks = new ClaudeNativeBackgroundTasks();
+    tasks.onFrame(frame("task_started", { task_id: "own", run_id: "r", tool_use_id: "town", task_type: "local_bash", is_backgrounded: true, owned_by_subagent: true }));
+    const done = frame("task_notification", { task_id: "own", run_id: "r", tool_use_id: "town", status: "completed" });
+    expect(tasks.takeTurnlessCompletion(done)).toBe(true);
+    expect(tasks.takeTurnlessCompletion(done)).toBe(false);
+    // Any task type, and a restart of the id without the flag is the main session's again.
+    tasks.onFrame(frame("task_started", { task_id: "a", tool_use_id: "ta", task_type: "local_agent", is_backgrounded: true, owned_by_subagent: true }));
+    tasks.onFrame(frame("task_started", { task_id: "a", tool_use_id: "ta", task_type: "local_agent", is_backgrounded: true }));
+    expect(tasks.takeTurnlessCompletion(frame("task_notification", { task_id: "a", tool_use_id: "ta", status: "completed" }))).toBe(false);
+  });
+  it("a stopped or killed task completes without a turn", () => {
+    const tasks = new ClaudeNativeBackgroundTasks();
+    for (const status of ["stopped", "killed"]) {
+      tasks.onFrame(frame("task_started", { task_id: status, tool_use_id: `t${status}`, task_type: "local_bash", is_backgrounded: true }));
+      expect(tasks.takeTurnlessCompletion(frame("task_notification", { task_id: status, tool_use_id: `t${status}`, status }))).toBe(true);
+    }
+  });
+  it("a main-session background task that completes is not turnless", () => {
+    const tasks = new ClaudeNativeBackgroundTasks();
+    tasks.onFrame(frame("task_started", { task_id: "m", tool_use_id: "tm", task_type: "local_bash", is_backgrounded: true }));
+    for (const status of ["completed", "failed"]) expect(tasks.takeTurnlessCompletion(frame("task_notification", { task_id: "m", tool_use_id: "tm", status }))).toBe(false);
+  });
+  it("ownership survives a backgrounding patch", () => {
+    const tasks = new ClaudeNativeBackgroundTasks();
+    tasks.onFrame(frame("task_started", { task_id: "o", run_id: "r", tool_use_id: "to", task_type: "local_bash", is_backgrounded: false, owned_by_subagent: true }));
+    tasks.onFrame(frame("task_updated", { task_id: "o", run_id: "r", patch: { is_backgrounded: true } }));
+    expect(tasks.takeTurnlessCompletion(frame("task_notification", { task_id: "o", run_id: "r", tool_use_id: "to", status: "completed" }))).toBe(true);
+  });
+  it("abandonAll forgets ownership", () => {
+    const tasks = new ClaudeNativeBackgroundTasks();
+    tasks.onFrame(frame("task_started", { task_id: "o", tool_use_id: "to", task_type: "local_bash", is_backgrounded: true, owned_by_subagent: true }));
+    tasks.abandonAll();
+    expect(tasks.takeTurnlessCompletion(frame("task_notification", { task_id: "o", tool_use_id: "to", status: "completed" }))).toBe(false);
   });
   it("flags foreground-tracked tasks and clears the flag when the CLI moves them to the background", () => {
     const tasks = new ClaudeNativeBackgroundTasks();
@@ -114,8 +149,8 @@ describe("native background task correlation", () => {
     tasks.onFrame(frame("task_started", { task_id: "x", run_id: "r1", tool_use_id: "t1", task_type: "local_bash", is_backgrounded: false }));
     tasks.onFrame(frame("task_started", { task_id: "x", run_id: "r2", tool_use_id: "t2", task_type: "local_bash", is_backgrounded: false }));
     tasks.onFrame(frame("task_updated", { task_id: "x", run_id: "r1", patch: { is_backgrounded: true } }));
-    expect(tasks.takeForegroundCompletion(frame("task_notification", { task_id: "x", run_id: "r1", tool_use_id: "t1", status: "completed" }))).toBe(false);
-    expect(tasks.takeForegroundCompletion(frame("task_notification", { task_id: "x", run_id: "r2", tool_use_id: "t2", status: "completed" }))).toBe(true);
+    expect(tasks.takeTurnlessCompletion(frame("task_notification", { task_id: "x", run_id: "r1", tool_use_id: "t1", status: "completed" }))).toBe(false);
+    expect(tasks.takeTurnlessCompletion(frame("task_notification", { task_id: "x", run_id: "r2", tool_use_id: "t2", status: "completed" }))).toBe(true);
   });
   it("does not infer tasks from unrelated or incomplete frames", () => {
     const tasks = new ClaudeNativeBackgroundTasks();
