@@ -2609,6 +2609,13 @@ export class ClaudeEngine implements SessionEngine {
         if (frame.type === "system") {
           continue; // init re-emit or status ping — state, not compaction outcome
         }
+        if (frame.type === "result" && taskNotificationRunId(frame) !== undefined) {
+          // The CLI's report turn for a noted run finished before the
+          // compaction's own result: it settles that run and is not the
+          // compaction's outcome. Its other frames fall to the discard below.
+          this.settleNotificationResult(frame);
+          continue;
+        }
         if (frame.type === "result") {
           terminal = true;
           // cross-review F7: cost IS session state — a manual compaction runs
@@ -3187,8 +3194,7 @@ export class ClaudeEngine implements SessionEngine {
    * whose stream carries its frames must not adopt its card. The tracker sends
    * a detached task's events to the sink itself; only an attached task's come
    * back. Idle and /compact both land here, so a notification noted during a
-   * compaction arms the CLI's report turn the same way (a tagged report result
-   * arriving inside the compaction loop is still taken as its outcome).
+   * compaction arms the CLI's report turn the same way.
    */
   private absorbSubagentFrame(frame: ClaudeStreamMessage): void {
     const knownSubagent = this.subagentTasks.knowsNotification(frame);

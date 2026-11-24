@@ -53,9 +53,8 @@ export class ClaudeNativeBackgroundTasks {
     const id = f.task_id;
     if (typeof id !== "string") return false;
     const foreground = this.foregroundRunMatches(id, f) && this.foreground.delete(id);
-    const ownedKey = [ClaudeNativeBackgroundTasks.ownedKey(id, f.run_id), ClaudeNativeBackgroundTasks.ownedKey(id, undefined)].find(key => this.subagentOwned.has(key));
-    if (ownedKey) this.subagentOwned.delete(ownedKey);
-    return foreground || ownedKey !== undefined || f.status === "stopped" || f.status === "killed";
+    const owned = this.subagentOwned.delete(ClaudeNativeBackgroundTasks.ownedKey(id, f.run_id)) || this.subagentOwned.delete(ClaudeNativeBackgroundTasks.ownedKey(id, undefined));
+    return foreground || owned || f.status === "stopped" || f.status === "killed";
   }
 
   /** Transport loss does not establish whether the native command stopped. */

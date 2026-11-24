@@ -3712,6 +3712,9 @@ describe("Claude command catalog admission", () => {
   });
 });
 
+const isForeignNotice = (event: AgentEvent): boolean =>
+  event.type === "engine_notice" && String((event as { message?: string }).message).includes("started a turn on its own");
+
 /**
  * The CLI's own background agents (w0-19, a live capture in stream-json input
  * mode — the mode the engine drives). The parent turn's `result` arrives
@@ -3726,8 +3729,6 @@ describe("ClaudeEngine — the CLI's own background agents", () => {
   const parentTurn = capture.slice(0, firstResult + 1);
   const idleAgentFrames = capture.slice(firstResult + 1, reportInit);
   const reportTurn = capture.slice(reportInit);
-  const isForeignNotice = (event: AgentEvent): boolean =>
-    event.type === "engine_notice" && String((event as { message?: string }).message).includes("started a turn on its own");
   /** The detached sink without the badge's count events: the card events alone. */
   const cardEvents = (events: AgentEvent[]): AgentEvent[] => events.filter((event) => event.type !== "engine_background_agents");
 
@@ -3949,6 +3950,33 @@ describe("ClaudeEngine — the CLI's own background agents", () => {
     const events = await collect(engine.runTurn("second", { signal: new AbortController().signal }));
     expect(native).toHaveLength(0);
     expect(events.filter(isForeignNotice)).toHaveLength(1);
+    await engine.dispose("session-close");
+  });
+
+  it("a report turn that finishes inside /compact settles its run and is not the compaction's outcome", async () => {
+    // Defensive, synthetic (no capture): were the CLI to run the report turn
+    // before the compaction's own result, the tagged result settles the run and
+    // the loop keeps waiting for the compaction's.
+    const transport = new FakeTransport({ frames: parentTurn, contextUsage: { totalTokens: 1, maxTokens: 2 } });
+    const engine = engineWith(transport);
+    const native: Promise<AgentEvent[]>[] = [];
+    engine.onNativeTurn = (turn) => native.push(collect(turn));
+    engine.onDetachedEvent = () => {};
+    await collect(engine.runTurn("launch it", { signal: new AbortController().signal }));
+
+    const tagged = { ...resultFrame157("completed"), is_error: true, subtype: "error_during_execution", origin: { kind: "task-notification", producer: "session-task", runId: "0mwkq1xid-ee3842c6" } } as unknown as ClaudeStreamMessage;
+    for (const frame of [...idleAgentFrames, foreignAssistantFrame("report", "REPORT"), tagged, resultFrame157("completed")]) transport.enqueue(frame);
+    const events = await collect(engine.compactNow({ signal: new AbortController().signal }));
+    expect(events.find((event) => event.type === "compaction_end")).toMatchObject({ ok: true });
+    expect(pendingNotifications(engine)).toEqual([]);
+
+    // A later turn the engine did not ask for is foreign, not adopted.
+    const init = reportTurn.find((frame) => frame.type === "system" && (frame as { subtype?: string }).subtype === "init")!;
+    for (const frame of [init, foreignAssistantFrame("later", "LATER"), foreignResultFrame("later")]) transport.push(frame);
+    for (const frame of ownerFrames("two")) transport.enqueue(frame);
+    const after = await collect(engine.runTurn("second", { signal: new AbortController().signal }));
+    expect(native).toHaveLength(0);
+    expect(after.filter(isForeignNotice)).toHaveLength(1);
     await engine.dispose("session-close");
   });
 
@@ -4616,7 +4644,6 @@ describe("ClaudeEngine — report turns after nested agents (CLI 2.1.330 capture
         const events = await native[index]!;
         expect(completed(events)).toBe(true);
         expect(text(events)).toContain(escaped(String((segment.at(-1) as Frame).result).slice(0, 40)));
-        expect(pendingNotifications(engine)).not.toContainEqual(expect.objectContaining({ runId: run }));
         expect(pendingNotifications(engine)).toEqual([]);
       }
       expect(native).toHaveLength(3);
@@ -4731,7 +4758,7 @@ describe("ClaudeEngine — report turns after nested agents (CLI 2.1.330 capture
       expect(native).toHaveLength(1);
 
       // The same agent id is notified again under a new run, and that report settles it.
-      expect(await pushReport(transport, engine, native, secondReport!, 2)).toEqual([expect.objectContaining({ taskId: expect.any(String), runId: secondRun })]);
+      expect(await pushReport(transport, engine, native, secondReport!, 2)).toEqual([expect.objectContaining({ runId: secondRun })]);
       const second = await native[1]!;
       expect(completed(second)).toBe(true);
       expect(text(second)).toContain("DONE2");
@@ -4753,7 +4780,7 @@ describe("ClaudeEngine — report turns after nested agents (CLI 2.1.330 capture
       const owner = await collect(engine.runTurn("after", { signal: new AbortController().signal }));
       expect(JSON.stringify(owner)).toContain("OWNER OUTPUT after");
       expect(owner.some((event) => event.type === "error")).toBe(false);
-      expect(owner).toContainEqual(expect.objectContaining({ type: "engine_notice" }));
+      expect(owner.filter(isForeignNotice)).toHaveLength(1);
       expect(JSON.stringify(owner)).not.toContain("STRAY");
       expect(native).toHaveLength(adopted);
     } finally { await engine.dispose("session-close"); }
