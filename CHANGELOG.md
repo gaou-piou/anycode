@@ -5,6 +5,12 @@ All notable AnyCode changes are recorded in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and version numbers follow [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- The sidebar shows how many agents are working in the background on a task, for Claude agents and for AnyCode's own detached agents.
+
 ## [0.0.110] - 2026-11-23
 
 ### Changed
