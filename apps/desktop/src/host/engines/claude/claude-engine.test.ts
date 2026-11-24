@@ -4530,10 +4530,6 @@ describe("ClaudeEngine — report turns after nested agents (CLI 2.1.330 capture
   };
   const reportRuns = (frames: readonly ClaudeStreamMessage[]): string[] =>
     (frames as Frame[]).filter((frame) => frame.type === "result" && frame.origin?.runId !== undefined).map((frame) => frame.origin!.runId!);
-  /** The runs of agent notifications, in the order the CLI announced them. */
-  const notifiedRuns = (frames: readonly ClaudeStreamMessage[]): string[] =>
-    (frames as Frame[]).filter((frame) => frame.subtype === "task_notification").map((frame) => frame.run_id!);
-
   /** Feeds a fixture: its first segment as the owner turn, the rest as the CLI produced it. */
   async function drive(file: string) {
     const [ownerTurn, ...rest] = segments(remapSession(bareFrames(file)));
@@ -4549,25 +4545,34 @@ describe("ClaudeEngine — report turns after nested agents (CLI 2.1.330 capture
   const text = (events: AgentEvent[]): string => JSON.stringify(events);
   const escaped = (value: string): string => JSON.stringify(value).slice(1, -1);
 
-  it("w0-22: three nested background agents each get their own adopted report turn, tagged with the run notified before it", async () => {
+  /** Pushes a segment up to its final result, then the result; returns the run entries pending in between. */
+  async function pushReport(transport: FakeTransport, engine: ClaudeEngine, native: Promise<AgentEvent[]>[], segment: ClaudeStreamMessage[], adoptedAfter: number): Promise<unknown[]> {
+    for (const frame of segment.slice(0, -1)) transport.push(frame);
+    // The idle frames are processed in order: once the engine has seen the notification it holds its entry.
+    const run = reportRuns(segment)[0]!;
+    await vi.waitFor(() => expect(pendingNotifications(engine)).toContainEqual(expect.objectContaining({ runId: run })));
+    const before = [...pendingNotifications(engine)];
+    transport.push(segment.at(-1)!);
+    await vi.waitFor(() => expect(native).toHaveLength(adoptedAfter));
+    return before;
+  }
+
+  it("w0-22: three nested background agents each get their own adopted report turn, and each report settles exactly the entry of the run it names", async () => {
     const { transport, engine, native, rest } = await drive("w0-22-nested-background-agents.jsonl");
     try {
-      const frames = rest.flat();
-      for (const frame of frames) transport.push(frame);
-      await vi.waitFor(() => expect(native).toHaveLength(3));
-      const adopted = await Promise.all(native);
-      const results = (frames as Frame[]).filter((frame) => frame.type === "result");
-      expect(results).toHaveLength(3);
-      adopted.forEach((events, index) => {
+      expect(rest).toHaveLength(3);
+      for (const [index, segment] of rest.entries()) {
+        const run = reportRuns(segment)[0]!;
+        const before = await pushReport(transport, engine, native, segment, index + 1);
+        // Only the agent notified before this report is waiting for it; the others are not announced yet.
+        expect(before).toEqual([expect.objectContaining({ runId: run })]);
+        const events = await native[index]!;
         expect(completed(events)).toBe(true);
-        expect(text(events)).toContain(escaped(String(results[index]!.result).slice(0, 40)));
-      });
-      // Each report names a different run, and each run was the agent's notification before that turn.
-      const runs = reportRuns(frames);
-      expect(new Set(runs).size).toBe(3);
-      const notified = notifiedRuns(frames);
-      for (const run of runs) expect(notified).toContain(run);
-      expect(pendingNotifications(engine)).toEqual([]);
+        expect(text(events)).toContain(escaped(String((segment.at(-1) as Frame).result).slice(0, 40)));
+        expect(pendingNotifications(engine)).not.toContainEqual(expect.objectContaining({ runId: run }));
+        expect(pendingNotifications(engine)).toEqual([]);
+      }
+      expect(native).toHaveLength(3);
     } finally { await engine.dispose("session-close"); }
   });
 
@@ -4579,7 +4584,7 @@ describe("ClaudeEngine — report turns after nested agents (CLI 2.1.330 capture
       await vi.waitFor(() => expect(native).toHaveLength(1));
       const events = await native[0]!;
       expect(completed(events)).toBe(true);
-      expect(text(events)).toContain("DONE");
+      expect(text(events)).toContain(escaped(String((frames.at(-1) as Frame).result)));
       expect(reportRuns(frames)).toHaveLength(1);
       expect(pendingNotifications(engine)).toEqual([]);
       expect(native).toHaveLength(1);
@@ -4595,7 +4600,19 @@ describe("ClaudeEngine — report turns after nested agents (CLI 2.1.330 capture
       expect(rest).toHaveLength(2);
       expect(reportTurnOf(rest[0]!).some((frame) => frame.type === "assistant")).toBe(false);
       expect(reportTurnOf(rest[1]!).some((frame) => frame.type === "assistant")).toBe(true);
-      for (const frame of rest.flat()) transport.push(frame);
+      const childRun = reportRuns(rest[0]!)[0]!;
+      const parentRun = reportRuns(rest[1]!)[0]!;
+
+      for (const frame of rest[0]!.slice(0, -1)) transport.push(frame);
+      await vi.waitFor(() => expect(pendingNotifications(engine)).toEqual([
+        expect.objectContaining({ runId: childRun }), expect.objectContaining({ runId: parentRun }),
+      ]));
+      transport.push(rest[0]!.at(-1)!);
+      // Only the child's entry settles; no turn is adopted for a report without an assistant frame.
+      await vi.waitFor(() => expect(pendingNotifications(engine)).toEqual([expect.objectContaining({ runId: parentRun })]));
+      expect(native).toHaveLength(0);
+
+      for (const frame of rest[1]!) transport.push(frame);
       await vi.waitFor(() => expect(native).toHaveLength(1));
       const events = await native[0]!;
       expect(completed(events)).toBe(true);
@@ -4605,29 +4622,29 @@ describe("ClaudeEngine — report turns after nested agents (CLI 2.1.330 capture
     } finally { await engine.dispose("session-close"); }
   });
 
-  it("w0-27: a SendMessage that resumes the agent gets a second adopted report turn, tagged with the resumed run", async () => {
+  it("w0-27: a SendMessage that resumes the agent gets a second adopted report turn that settles the resumed run's entry", async () => {
     const { transport, engine, native, rest } = await drive("w0-27-sendmessage-resumes-agent.jsonl");
     try {
       const [firstReport, resumeOwnerTurn, secondReport] = rest;
       expect(rest).toHaveLength(3);
-      for (const frame of firstReport!) transport.push(frame);
-      await vi.waitFor(() => expect(native).toHaveLength(1));
+      const firstRun = reportRuns(firstReport!)[0]!;
+      const secondRun = reportRuns(secondReport!)[0]!;
+      expect(secondRun).not.toBe(firstRun);
+
+      expect(await pushReport(transport, engine, native, firstReport!, 1)).toEqual([expect.objectContaining({ runId: firstRun })]);
       expect(text(await native[0]!)).toContain("DONE1");
+      expect(pendingNotifications(engine)).toEqual([]);
 
       for (const frame of resumeOwnerTurn!) transport.enqueue(frame);
       const owner = await collect(engine.runTurn("resume it", { signal: new AbortController().signal }));
       expect(completed(owner)).toBe(true);
       expect(native).toHaveLength(1);
 
-      for (const frame of secondReport!) transport.push(frame);
-      await vi.waitFor(() => expect(native).toHaveLength(2));
+      // The same agent id is notified again under a new run, and that report settles it.
+      expect(await pushReport(transport, engine, native, secondReport!, 2)).toEqual([expect.objectContaining({ taskId: expect.any(String), runId: secondRun })]);
       const second = await native[1]!;
       expect(completed(second)).toBe(true);
       expect(text(second)).toContain("DONE2");
-      const [firstRun, secondRun] = [reportRuns(firstReport!)[0], reportRuns(secondReport!)[0]];
-      expect(secondRun).toBeDefined();
-      expect(secondRun).not.toBe(firstRun);
-      expect(notifiedRuns(secondReport!)).toContain(secondRun);
       expect(pendingNotifications(engine)).toEqual([]);
     } finally { await engine.dispose("session-close"); }
   });
