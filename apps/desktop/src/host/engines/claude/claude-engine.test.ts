@@ -256,6 +256,28 @@ class FakeTransport implements ClaudeTransport {
   }
 }
 
+/** A bare fixture: every line IS a stdout frame (no dir/raw envelope). */
+function bareFrames(file: string): ClaudeStreamMessage[] {
+  return readFileSync(join(FIXTURES_DIR, file), "utf8")
+    .split("\n")
+    .filter((line) => line.trim() !== "")
+    .map((line) => JSON.parse(line) as ClaudeStreamMessage);
+}
+
+/** The result of a turn the CLI started for a finished background task, tagged with that task's run. */
+function taggedResult(label: string, runId: string): ClaudeStreamMessage {
+  return { ...foreignResultFrame(label), origin: { kind: "task-notification", producer: "session-task", runId } } as unknown as ClaudeStreamMessage;
+}
+
+/** The frames with the CLI's session id replaced by the one the test engine is bound to. */
+function remapSession(frames: readonly ClaudeStreamMessage[], sessionId = "session-ref-1"): ClaudeStreamMessage[] {
+  return frames.map((frame) => ("session_id" in frame ? { ...frame, session_id: sessionId } : frame) as ClaudeStreamMessage);
+}
+
+function pendingNotifications(engine: ClaudeEngine): unknown[] {
+  return (engine as unknown as { pendingNotifications: unknown[] }).pendingNotifications;
+}
+
 /**
  * Builds an engine with a real settings object. `ClaudeEngineSettings` is not
  * exported, but it is structurally satisfiable — the catalog and preset lookup
@@ -3698,10 +3720,7 @@ describe("Claude command catalog admission", () => {
  */
 describe("ClaudeEngine — the CLI's own background agents", () => {
   // A bare fixture: every line IS a stdout frame (no dir/raw envelope).
-  const capture = readFileSync(join(FIXTURES_DIR, "w0-19-background-agent.jsonl"), "utf8")
-    .split("\n")
-    .filter((line) => line.trim() !== "")
-    .map((line) => JSON.parse(line) as ClaudeStreamMessage);
+  const capture = bareFrames("w0-19-background-agent.jsonl");
   const firstResult = capture.findIndex((frame) => frame.type === "result");
   const reportInit = capture.findIndex((frame, index) => index > firstResult && frame.type === "system" && (frame as { subtype?: string }).subtype === "init");
   const parentTurn = capture.slice(0, firstResult + 1);
@@ -3778,7 +3797,30 @@ describe("ClaudeEngine — the CLI's own background agents", () => {
     expect(counts()).toHaveLength(2);
   });
 
-  it("the CLI's own report turn after the agent finishes is still absorbed as a foreign turn", async () => {
+  it("the CLI's report turn after a background agent finishes is adopted", async () => {
+    const transport = new FakeTransport({ frames: parentTurn, contextUsage: { totalTokens: 1, maxTokens: 2 } });
+    const engine = engineWith(transport);
+    const native: Promise<AgentEvent[]>[] = [];
+    engine.onNativeTurn = (turn) => native.push(collect(turn));
+    engine.onDetachedEvent = () => {};
+    await collect(engine.runTurn("launch it", { signal: new AbortController().signal }));
+
+    for (const frame of remapSession([...idleAgentFrames, ...reportTurn])) transport.push(frame);
+    await vi.waitFor(() => expect(native).toHaveLength(1));
+    const adopted = await native[0]!;
+    const reportText = String((reportTurn.at(-1) as { result?: string }).result);
+    expect(adopted).toContainEqual(expect.objectContaining({ type: "loop_end", reason: "completed" }));
+    expect(JSON.stringify(adopted)).toContain(JSON.stringify(reportText).slice(1, -1));
+    expect(pendingNotifications(engine)).toEqual([]);
+    for (const frame of ownerFrames("two")) transport.enqueue(frame);
+    const events = await collect(engine.runTurn("second", { signal: new AbortController().signal }));
+    expect(events.filter(isForeignNotice)).toEqual([]);
+    expect(JSON.stringify(events)).toContain("OWNER OUTPUT two");
+    expect(native).toHaveLength(1);
+    await engine.dispose("session-close");
+  });
+
+  it("without a native-turn listener, the report turn is absorbed as a foreign turn", async () => {
     const transport = new FakeTransport({ frames: parentTurn, contextUsage: { totalTokens: 1, maxTokens: 2 } });
     const engine = engineWith(transport);
     engine.onDetachedEvent = () => {};
@@ -4143,8 +4185,6 @@ describe("Claude notification-driven turns (5370 review follow-ups)", () => {
   const echo = (text: string, extra: Record<string, unknown> = {}) => ({ type: "user", isReplay: true, message: { role: "user", content: text }, ...extra }) as unknown as ClaudeStreamMessage;
   const backgroundBash = (id: string) => ({ type: "system", subtype: "task_started", task_id: id, run_id: `run-${id}`, tool_use_id: `toolu_${id}`, task_type: "local_bash", is_backgrounded: true }) as unknown as ClaudeStreamMessage;
   const notified = (id: string) => ({ type: "system", subtype: "task_notification", task_id: id, run_id: `run-${id}`, tool_use_id: `toolu_${id}`, status: "completed" }) as unknown as ClaudeStreamMessage;
-  const tagged = (label: string, runId: string) => ({ ...foreignResultFrame(label), origin: { kind: "task-notification", producer: "session-task", runId } }) as unknown as ClaudeStreamMessage;
-  const pending = (engine: ClaudeEngine) => (engine as unknown as { pendingNotifications: unknown[] }).pendingNotifications;
   /** Fails a turn that waits forever instead of hanging the suite. */
   const collectWithin = async (stream: AsyncIterable<AgentEvent>, ms = 2_000): Promise<AgentEvent[]> => {
     const events: AgentEvent[] = [];
@@ -4203,14 +4243,14 @@ describe("Claude notification-driven turns (5370 review follow-ups)", () => {
     const engine = engineWith(transport); const native: Promise<AgentEvent[]>[] = []; engine.onNativeTurn = turn => native.push(collect(turn));
     try {
       await collect(engine.runTurn("launch", { signal: new AbortController().signal }));
-      for (const frame of [notified("a"), notified("b"), init, foreignAssistantFrame("native-b", "NATIVE B"), tagged("native-b", "run-b")]) transport.push(frame);
+      for (const frame of [notified("a"), notified("b"), init, foreignAssistantFrame("native-b", "NATIVE B"), taggedResult("native-b", "run-b")]) transport.push(frame);
       await vi.waitFor(() => expect(native).toHaveLength(1));
       expect(JSON.stringify(await native[0]!)).toContain("NATIVE B");
-      expect(pending(engine)).toEqual([expect.objectContaining({ taskId: "a", runId: "run-a" })]);
-      for (const frame of [init, foreignAssistantFrame("native-a", "NATIVE A"), tagged("native-a", "run-a")]) transport.push(frame);
+      expect(pendingNotifications(engine)).toEqual([expect.objectContaining({ taskId: "a", runId: "run-a" })]);
+      for (const frame of [init, foreignAssistantFrame("native-a", "NATIVE A"), taggedResult("native-a", "run-a")]) transport.push(frame);
       await vi.waitFor(() => expect(native).toHaveLength(2));
       expect(JSON.stringify(await native[1]!)).toContain("NATIVE A");
-      expect(pending(engine)).toEqual([]);
+      expect(pendingNotifications(engine)).toEqual([]);
       for (const frame of [init, ...ownerFrames("next")]) transport.enqueue(frame);
       const next = await collect(engine.runTurn("next", { signal: new AbortController().signal }));
       expect(next.some(event => event.type === "error")).toBe(false);
@@ -4226,7 +4266,7 @@ describe("Claude notification-driven turns (5370 review follow-ups)", () => {
       for (const frame of [init, echo("go"), assistantFrame("work"), notified("a"), echo("<task-notification>done</task-notification>", { origin: { kind: "task-notification", runId: "run-a" } }), ...ownerFrames("go")]) transport.enqueue(frame);
       const events = await collect(engine.runTurn("go", { signal: new AbortController().signal }));
       expect(events).toContainEqual(expect.objectContaining({ type: "loop_end", reason: "completed" }));
-      expect(pending(engine)).toEqual([]);
+      expect(pendingNotifications(engine)).toEqual([]);
     } finally { await engine.dispose("session-close"); }
   });
 
@@ -4236,9 +4276,9 @@ describe("Claude notification-driven turns (5370 review follow-ups)", () => {
     try {
       await collect(engine.runTurn("launch", { signal: new AbortController().signal }));
       transport.push(notified("a"));
-      await vi.waitFor(() => expect(pending(engine)).toHaveLength(1));
+      await vi.waitFor(() => expect(pendingNotifications(engine)).toHaveLength(1));
       await transport.close();
-      await vi.waitFor(() => expect(pending(engine)).toEqual([]));
+      await vi.waitFor(() => expect(pendingNotifications(engine)).toEqual([]));
     } finally { await engine.dispose("session-close"); }
   });
 
@@ -4247,7 +4287,7 @@ describe("Claude notification-driven turns (5370 review follow-ups)", () => {
     const engine = engineWith(transport); const adopted = vi.fn(); engine.onNativeTurn = adopted;
     try {
       await collect(engine.runTurn("launch", { signal: new AbortController().signal }));
-      for (const frame of [notified("a"), init, foreignAssistantFrame("bg", "BACKGROUND PART"), echo("ping"), foreignAssistantFrame("owner", "PONG"), tagged("folded", "run-a")]) transport.enqueue(frame);
+      for (const frame of [notified("a"), init, foreignAssistantFrame("bg", "BACKGROUND PART"), echo("ping"), foreignAssistantFrame("owner", "PONG"), taggedResult("folded", "run-a")]) transport.enqueue(frame);
       const accepted = vi.fn();
       const events = await collectWithin(engine.runTurn("ping", { signal: new AbortController().signal, onInputAccepted: accepted }));
       expect(JSON.stringify(events)).toContain("PONG");
@@ -4255,7 +4295,7 @@ describe("Claude notification-driven turns (5370 review follow-ups)", () => {
       expect(events.some(event => event.type === "error")).toBe(false);
       expect(accepted).toHaveBeenCalled();
       expect(adopted).not.toHaveBeenCalled();
-      expect(pending(engine)).toEqual([]);
+      expect(pendingNotifications(engine)).toEqual([]);
     } finally { await engine.dispose("session-close"); }
   });
 
@@ -4265,8 +4305,8 @@ describe("Claude notification-driven turns (5370 review follow-ups)", () => {
     try {
       await collect(engine.runTurn("launch", { signal: new AbortController().signal }));
       transport.push(notified("a")); transport.push(init);
-      await vi.waitFor(() => expect(pending(engine)).toEqual([]));
-      for (const frame of [foreignAssistantFrame("bg", "BACKGROUND PART"), userToolResultFrame("sleep"), echo("ping"), foreignAssistantFrame("owner", "PONG"), tagged("folded", "run-a")]) transport.enqueue(frame);
+      await vi.waitFor(() => expect(pendingNotifications(engine)).toEqual([]));
+      for (const frame of [foreignAssistantFrame("bg", "BACKGROUND PART"), userToolResultFrame("sleep"), echo("ping"), foreignAssistantFrame("owner", "PONG"), taggedResult("folded", "run-a")]) transport.enqueue(frame);
       const events = await collectWithin(engine.runTurn("ping", { signal: new AbortController().signal }));
       expect(JSON.stringify(events)).toContain("PONG");
       expect(events).toContainEqual(expect.objectContaining({ type: "loop_end", reason: "completed" }));
@@ -4312,11 +4352,11 @@ describe("Claude notification-driven turns (5370 review follow-ups)", () => {
     try {
       await collect(engine.runTurn("launch", { signal: new AbortController().signal }));
       if (moved) {
-        for (const frame of [{ type: "system", subtype: "task_notification", task_id: "fg", run_id: "run-fg", tool_use_id: "toolu_fg", status: "completed" }, init, foreignAssistantFrame("native", "NATIVE FG"), tagged("native", "run-fg")]) transport.push(frame as ClaudeStreamMessage);
+        for (const frame of [{ type: "system", subtype: "task_notification", task_id: "fg", run_id: "run-fg", tool_use_id: "toolu_fg", status: "completed" }, init, foreignAssistantFrame("native", "NATIVE FG"), taggedResult("native", "run-fg")]) transport.push(frame as ClaudeStreamMessage);
         await vi.waitFor(() => expect(native).toHaveLength(1));
         expect(JSON.stringify(await native[0]!)).toContain("NATIVE FG");
       } else {
-        expect(pending(engine)).toEqual([]);
+        expect(pendingNotifications(engine)).toEqual([]);
       }
       for (const frame of [init, ...ownerFrames("next")]) transport.enqueue(frame);
       const next = await collect(engine.runTurn("next", { signal: new AbortController().signal }));
@@ -4331,7 +4371,7 @@ describe("Claude notification-driven turns (5370 review follow-ups)", () => {
     try {
       await collect(engine.runTurn("launch", { signal: new AbortController().signal }));
       const flood = Array.from({ length: 20_001 }, () => ({ type: "rate_limit_event" }) as unknown as ClaudeStreamMessage);
-      for (const frame of [notified("a"), init, ...flood, foreignAssistantFrame("native", "NATIVE"), tagged("native", "run-a"), init, ...ownerFrames("after")]) transport.enqueue(frame);
+      for (const frame of [notified("a"), init, ...flood, foreignAssistantFrame("native", "NATIVE"), taggedResult("native", "run-a"), init, ...ownerFrames("after")]) transport.enqueue(frame);
       const events = await collectWithin(engine.runTurn("after", { signal: new AbortController().signal }), 10_000);
       expect(events.some(event => event.type === "error")).toBe(false);
       expect(JSON.stringify(events)).toContain("OWNER OUTPUT after");
@@ -4350,7 +4390,7 @@ describe("Claude notification-driven turns (5370 review follow-ups)", () => {
         { type: "rate_limit_event", rate_limit_info: { status: "allowed" } },
         { type: "system", subtype: "task_progress", task_id: "other", description: "still running" },
       ];
-      for (const frame of [notified("a"), init, foreignAssistantFrame("folded", "FOLDED ANSWER"), tagged("folded", "run-a"), ...noise]) transport.enqueue(frame as ClaudeStreamMessage);
+      for (const frame of [notified("a"), init, foreignAssistantFrame("folded", "FOLDED ANSWER"), taggedResult("folded", "run-a"), ...noise]) transport.enqueue(frame as ClaudeStreamMessage);
       const accepted = vi.fn();
       const events = await collectWithin(engine.runTurn(report, { signal: new AbortController().signal, origin: "system", onInputAccepted: accepted }));
       expect(events.some(event => event.type === "error")).toBe(false);
@@ -4457,7 +4497,7 @@ describe("Claude notification-driven turns (5370 review follow-ups)", () => {
       await collect(engine.runTurn("launch", { signal: new AbortController().signal }));
       for (const frame of [notified("a"), init, foreignAssistantFrame("odd", "ODD"), { ...foreignResultFrame("odd"), origin: { kind: "unknown-producer" } }]) transport.enqueue(frame as ClaudeStreamMessage);
       await collectWithin(engine.runTurn(report, { signal: new AbortController().signal, origin: "system" }));
-      expect(pending(engine)).toEqual([expect.objectContaining({ taskId: "a", runId: "run-a" })]);
+      expect(pendingNotifications(engine)).toEqual([expect.objectContaining({ taskId: "a", runId: "run-a" })]);
     } finally { await engine.dispose("session-close"); }
   });
 
@@ -4469,10 +4509,126 @@ describe("Claude notification-driven turns (5370 review follow-ups)", () => {
     try {
       await collect(engine.runTurn("launch", { signal: new AbortController().signal }));
       for (const frame of [plain("a"), notified("b"), notified("c")]) transport.push(frame);
-      await vi.waitFor(() => expect(pending(engine)).toHaveLength(3));
-      for (const frame of [init, echo("<task-notification>a</task-notification>", { origin: { kind: "task-notification" } }), foreignAssistantFrame("native-c", "NATIVE C"), tagged("native-c", "run-c"), init, echo("go"), ...ownerFrames("go")]) transport.enqueue(frame);
+      await vi.waitFor(() => expect(pendingNotifications(engine)).toHaveLength(3));
+      for (const frame of [init, echo("<task-notification>a</task-notification>", { origin: { kind: "task-notification" } }), foreignAssistantFrame("native-c", "NATIVE C"), taggedResult("native-c", "run-c"), init, echo("go"), ...ownerFrames("go")]) transport.enqueue(frame);
       await collectWithin(engine.runTurn("go", { signal: new AbortController().signal }));
-      expect(pending(engine)).toEqual([expect.objectContaining({ taskId: "b", runId: "run-b" })]);
+      expect(pendingNotifications(engine)).toEqual([expect.objectContaining({ taskId: "b", runId: "run-b" })]);
+    } finally { await engine.dispose("session-close"); }
+  });
+});
+
+describe("ClaudeEngine — report turns after nested agents (CLI 2.1.330 captures)", () => {
+  type Frame = ClaudeStreamMessage & { origin?: { runId?: string }; result?: string; subtype?: string; run_id?: string };
+  /** The capture cut after each `result`: the owner turn first, then what the CLI did on its own. */
+  const segments = (frames: readonly ClaudeStreamMessage[]): ClaudeStreamMessage[][] => {
+    const out: ClaudeStreamMessage[][] = [[]];
+    for (const frame of frames) {
+      out.at(-1)!.push(frame);
+      if (frame.type === "result") out.push([]);
+    }
+    return out.filter((segment) => segment.length > 0);
+  };
+  const reportRuns = (frames: readonly ClaudeStreamMessage[]): string[] =>
+    (frames as Frame[]).filter((frame) => frame.type === "result" && frame.origin?.runId !== undefined).map((frame) => frame.origin!.runId!);
+  /** The runs of agent notifications, in the order the CLI announced them. */
+  const notifiedRuns = (frames: readonly ClaudeStreamMessage[]): string[] =>
+    (frames as Frame[]).filter((frame) => frame.subtype === "task_notification").map((frame) => frame.run_id!);
+
+  /** Feeds a fixture: its first segment as the owner turn, the rest as the CLI produced it. */
+  async function drive(file: string) {
+    const [ownerTurn, ...rest] = segments(remapSession(bareFrames(file)));
+    const transport = new FakeTransport({ frames: ownerTurn!, contextUsage: { totalTokens: 1, maxTokens: 2 } });
+    const engine = engineWith(transport);
+    const native: Promise<AgentEvent[]>[] = [];
+    engine.onNativeTurn = (turn) => native.push(collect(turn));
+    engine.onDetachedEvent = () => {};
+    await collect(engine.runTurn("launch it", { signal: new AbortController().signal }));
+    return { transport, engine, native, rest };
+  }
+  const completed = (events: AgentEvent[]): boolean => events.some((event) => event.type === "loop_end" && event.reason === "completed");
+  const text = (events: AgentEvent[]): string => JSON.stringify(events);
+  const escaped = (value: string): string => JSON.stringify(value).slice(1, -1);
+
+  it("w0-22: three nested background agents each get their own adopted report turn, tagged with the run notified before it", async () => {
+    const { transport, engine, native, rest } = await drive("w0-22-nested-background-agents.jsonl");
+    try {
+      const frames = rest.flat();
+      for (const frame of frames) transport.push(frame);
+      await vi.waitFor(() => expect(native).toHaveLength(3));
+      const adopted = await Promise.all(native);
+      const results = (frames as Frame[]).filter((frame) => frame.type === "result");
+      expect(results).toHaveLength(3);
+      adopted.forEach((events, index) => {
+        expect(completed(events)).toBe(true);
+        expect(text(events)).toContain(escaped(String(results[index]!.result).slice(0, 40)));
+      });
+      // Each report names a different run, and each run was the agent's notification before that turn.
+      const runs = reportRuns(frames);
+      expect(new Set(runs).size).toBe(3);
+      const notified = notifiedRuns(frames);
+      for (const run of runs) expect(notified).toContain(run);
+      expect(pendingNotifications(engine)).toEqual([]);
+    } finally { await engine.dispose("session-close"); }
+  });
+
+  it("w0-21: one adopted report turn for the nested foreground agents, and nothing pending for the foreground children", async () => {
+    const { transport, engine, native, rest } = await drive("w0-21-nested-foreground-agents.jsonl");
+    try {
+      const frames = rest.flat();
+      for (const frame of frames) transport.push(frame);
+      await vi.waitFor(() => expect(native).toHaveLength(1));
+      const events = await native[0]!;
+      expect(completed(events)).toBe(true);
+      expect(text(events)).toContain("DONE");
+      expect(reportRuns(frames)).toHaveLength(1);
+      expect(pendingNotifications(engine)).toEqual([]);
+      expect(native).toHaveLength(1);
+    } finally { await engine.dispose("session-close"); }
+  });
+
+  it("w0-26: the nested agent's report turn has no assistant frame and adopts nothing, but settles its entry; the parent's report turn is adopted", async () => {
+    const { transport, engine, native, rest } = await drive("w0-26-nested-agent-finishes-before-parent.jsonl");
+    try {
+      // The capture splits as described: the idle segment ends in the child's
+      // report turn (an init straight to a result), the last one is the parent's.
+      const reportTurnOf = (segment: ClaudeStreamMessage[]): ClaudeStreamMessage[] => segment.slice(segment.map((frame) => frame.type === "system" && (frame as Frame).subtype === "init").lastIndexOf(true));
+      expect(rest).toHaveLength(2);
+      expect(reportTurnOf(rest[0]!).some((frame) => frame.type === "assistant")).toBe(false);
+      expect(reportTurnOf(rest[1]!).some((frame) => frame.type === "assistant")).toBe(true);
+      for (const frame of rest.flat()) transport.push(frame);
+      await vi.waitFor(() => expect(native).toHaveLength(1));
+      const events = await native[0]!;
+      expect(completed(events)).toBe(true);
+      expect(text(events)).toContain("CHILD");
+      expect(native).toHaveLength(1);
+      expect(pendingNotifications(engine)).toEqual([]);
+    } finally { await engine.dispose("session-close"); }
+  });
+
+  it("w0-27: a SendMessage that resumes the agent gets a second adopted report turn, tagged with the resumed run", async () => {
+    const { transport, engine, native, rest } = await drive("w0-27-sendmessage-resumes-agent.jsonl");
+    try {
+      const [firstReport, resumeOwnerTurn, secondReport] = rest;
+      expect(rest).toHaveLength(3);
+      for (const frame of firstReport!) transport.push(frame);
+      await vi.waitFor(() => expect(native).toHaveLength(1));
+      expect(text(await native[0]!)).toContain("DONE1");
+
+      for (const frame of resumeOwnerTurn!) transport.enqueue(frame);
+      const owner = await collect(engine.runTurn("resume it", { signal: new AbortController().signal }));
+      expect(completed(owner)).toBe(true);
+      expect(native).toHaveLength(1);
+
+      for (const frame of secondReport!) transport.push(frame);
+      await vi.waitFor(() => expect(native).toHaveLength(2));
+      const second = await native[1]!;
+      expect(completed(second)).toBe(true);
+      expect(text(second)).toContain("DONE2");
+      const [firstRun, secondRun] = [reportRuns(firstReport!)[0], reportRuns(secondReport!)[0]];
+      expect(secondRun).toBeDefined();
+      expect(secondRun).not.toBe(firstRun);
+      expect(notifiedRuns(secondReport!)).toContain(secondRun);
+      expect(pendingNotifications(engine)).toEqual([]);
     } finally { await engine.dispose("session-close"); }
   });
 });
